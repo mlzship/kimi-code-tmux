@@ -6,7 +6,7 @@
 
 ```
 kc [-C 目录] [会话名] [-- kimi参数...]  启动或接入会话(默认会话名: kimi)
-kc ls                                  列出所有会话及 kimi 运行状态
+kc ls [-a|--all]                       列出受管会话及 kimi 运行状态(--all 显示全部 tmux 会话)
 kc peek [会话名] [行数]                 查看实例最近输出(默认 40 行)
 kc restart [-y|--yes] [会话名]          原地重启实例(kimi --continue,保留会话历史)
 kc upgrade [-y|--yes] [--all] [会话名]  升级 kimi 并重启实例
