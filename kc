@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-KC_VERSION="1.1.3"
+KC_VERSION="1.1.4"
 DEFAULT_SESSION="kimi"
 
 die() { echo "kc: $*" >&2; exit 1; }
@@ -28,6 +28,8 @@ kc - 在 tmux 中启动/管理 Kimi Code CLI
   - 会话名不能包含 . : 或空格
   - 启动时 -- 之后的参数会传给 kimi,并记录在会话中,供 restart/upgrade 复用
   - restart/upgrade 会检测实例是否繁忙,繁忙时需确认(-y 跳过确认)
+  - restart/upgrade 优先用记录的 @kc_session_id 精确恢复原会话(kimi --session),
+    无记录时回退 kimi --continue 并在启动后自动捕获绑定会话供下次使用
   - upgrade 时若二进制已是最新,会继续检查运行中的实例是否过旧,仅重启过旧实例
 EOF
 }
@@ -104,17 +106,51 @@ kc_sessions() {
     } | sort -u
 }
 
+# 后台监视: 找到 since 之后被创建/写入的会话(按 cwd 匹配),把其 id 记录到 @kc_session_id
+# 用于在新建/重启实例后捕获实例绑定的 kimi 会话,供下次用 kimi --session <id> 精确恢复
+watch_record_session() {
+    local tm_session="$1" cwd="$2" since="$3" home d
+    home="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+    for _ in $(seq 1 600); do
+        for d in "$home"/sessions/*/session_*/; do
+            [ -f "$d/state.json" ] || continue
+            grep -qF "\"cwd\":\"$cwd\"" "$d/state.json" 2>/dev/null || continue
+            if [ -n "$(find "$d" -newermt "@$since" -print -quit 2>/dev/null)" ]; then
+                tmux set-option -t "$tm_session" @kc_session_id "$(basename "$d")" 2>/dev/null
+                exit 0
+            fi
+        done
+        sleep 0.5
+    done
+}
+
 restart_session() {
-    local s="$1" force="${2:-0}" pane quoted cmd
+    local s="$1" force="${2:-0}" pane quoted cmd sid home cwd ts
     pane=$(find_kimi_pane "$s")
     [ -n "$pane" ] || die "会话 '$s' 中没有可用面板"
     if [ "$force" != 1 ] && pane_busy "$pane"; then
         confirm "会话 '$s' 的实例疑似正在执行任务,仍要重启"
     fi
     quoted=$(tmux show-option -qv -t "$s" @kc_args)
-    cmd="kimi --continue"
+    sid=$(tmux show-option -qv -t "$s" @kc_session_id)
+    home="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+    if [ -n "$sid" ] && ! ls -d "$home"/sessions/*/"$sid" >/dev/null 2>&1; then
+        echo "kc: 记录的会话 $sid 已不存在,回退为 --continue" >&2
+        sid=""
+    fi
+    if [ -n "$sid" ]; then
+        cmd="kimi --session $sid"
+    else
+        cmd="kimi --continue"
+    fi
     [ -z "$quoted" ] || cmd="$cmd $quoted"
+    cwd=$(tmux display-message -p -t "$pane" '#{pane_current_path}')
+    ts=$(( $(date +%s) - 1 ))
     tmux respawn-pane -k -t "$pane" "$cmd"
+    # 仅当用 --continue 兜底时才需要事后捕获;--session 恢复的 id 已知,避免并发会话干扰
+    if [ -z "$sid" ]; then
+        ( watch_record_session "$s" "$cwd" "$ts" >/dev/null 2>&1 & )
+    fi
     echo "kc: 会话 '$s' 已重启 ($cmd)"
 }
 
@@ -154,6 +190,7 @@ cmd_open() {
     local tmargs=(-s "$session")
     [ -z "$dir" ] || tmargs+=(-c "$dir")
     tmargs+=("$cmd" \; set-option mouse on \; set-option @kc_managed 1 \; set-option @kc_args "$quoted")
+    ( watch_record_session "$session" "${dir:-$PWD}" "$(( $(date +%s) - 1 ))" >/dev/null 2>&1 & )
     if [ -n "${TMUX:-}" ]; then
         tmux new-session -d "${tmargs[@]}"
         exec tmux switch-client -t "$session"
