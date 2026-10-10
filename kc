@@ -43,7 +43,7 @@ valid_session() {
 find_kimi_pane() {
     local pane
     pane=$(tmux list-panes -t "$1" -F '#{pane_id} #{pane_current_command}' 2>/dev/null \
-        | awk '$2=="kimi"{print $1; exit}')
+        | awk '$2 ~ /^kimi(-code)?$/{print $1; exit}')
     if [ -z "$pane" ]; then
         pane=$(tmux display-message -p -t "$1" '#{pane_id}')
     fi
@@ -73,11 +73,13 @@ confirm() {
 kimi_pid_of_pane() {
     local pid
     pid=$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null) || return 1
-    if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "kimi" ]; then
-        echo "$pid"
-        return 0
-    fi
-    pgrep -xo kimi 2>/dev/null | head -1
+    case "$(cat "/proc/$pid/comm" 2>/dev/null)" in
+        kimi|kimi-code)
+            echo "$pid"
+            return 0
+            ;;
+    esac
+    pgrep -x 'kimi(-code)?' 2>/dev/null | head -1
 }
 
 # 运行中的实例是否仍是旧二进制: 二进制被替换后,旧进程的 exe 指向已删除文件
@@ -94,7 +96,7 @@ instance_stale() {
 kc_sessions() {
     {
         tmux list-panes -a -F '#{session_name} #{pane_current_command}' 2>/dev/null \
-            | awk '$2=="kimi"{print $1}'
+            | awk '$2 ~ /^kimi(-code)?$/{print $1}'
         tmux list-sessions -F '#{session_name}' 2>/dev/null \
             | while read -r s; do
                 [ "$(tmux show-option -qv -t "$s" @kc_managed)" = "1" ] && echo "$s"
@@ -173,7 +175,7 @@ cmd_ls() {
         attached=$(tmux display-message -p -t "$s" '#{session_attached}')
         [ "$attached" = "1" ] && attached="是" || attached="否"
         pid=$(tmux list-panes -t "$s" -F '#{pane_current_command} #{pane_pid}' \
-            | awk '$1=="kimi"{print $2; exit}')
+            | awk '$1 ~ /^kimi(-code)?$/{print $2; exit}')
         if [ -n "$pid" ]; then
             etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
             if instance_stale "$pid"; then
