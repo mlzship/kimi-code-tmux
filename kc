@@ -1,36 +1,261 @@
 #!/usr/bin/env bash
-# kc - 在 tmux 会话中启动 kimi code,并开启鼠标模式
-# 用法: kc [会话名]          默认会话名 kimi;会话已存在则直接接入
-#       kc upgrade [会话名]  升级 kimi 到最新版,并原地重启 tmux 会话中的实例
-#                            (旧进程会被终止,以 kimi --continue 重启,会话历史自动恢复)
+# kc - 在 tmux 会话中启动/管理 Kimi Code CLI
+# 用法见 kc -h
 
-set -e
+set -euo pipefail
 
-if [ "$1" = "upgrade" ]; then
-    SESSION="${2:-kimi}"
+KC_VERSION="1.1.0"
+DEFAULT_SESSION="kimi"
 
-    echo "==> 升级 kimi code..."
-    kimi upgrade -y
+die() { echo "kc: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "缺少依赖: $1"; }
 
-    if tmux has-session -t "$SESSION" 2>/dev/null; then
-        echo "==> 重启 tmux 会话 '$SESSION' 中的实例(旧进程将被终止)..."
-        tmux respawn-pane -k -t "$SESSION" 'kimi --continue'
-        echo "完成: '$SESSION' 中的实例已更新并恢复原会话,执行 kc 即可接入。"
-    else
-        echo "完成: kimi 已升级;tmux 会话 '$SESSION' 不存在,无需重启。"
+usage() {
+    cat <<'EOF'
+kc - 在 tmux 中启动/管理 Kimi Code CLI
+
+用法:
+  kc [-C 目录] [会话名] [-- kimi参数...]  启动或接入会话(默认会话名: kimi)
+  kc ls                                  列出所有会话及 kimi 运行状态
+  kc peek [会话名] [行数]                 查看实例最近输出(默认 40 行)
+  kc restart [-y|--yes] [会话名]          原地重启实例(kimi --continue,保留会话历史)
+  kc upgrade [-y|--yes] [--all] [会话名]  升级 kimi 并重启实例
+  kc stop [会话名]                        结束整个 tmux 会话
+  kc -h|--help                           显示本帮助
+  kc -V|--version                        显示 kc 版本
+
+说明:
+  - 会话名不能包含 . : 或空格
+  - 启动时 -- 之后的参数会传给 kimi,并记录在会话中,供 restart/upgrade 复用
+  - restart/upgrade 会检测实例是否繁忙,繁忙时需确认(-y 跳过确认)
+  - upgrade 时若 kimi 已是最新则跳过重启;--all 表示更新所有受管会话
+EOF
+}
+
+valid_session() {
+    case "$1" in
+        ""|*.*|*:*|*" "*|*$'\t'*) return 1 ;;
+    esac
+    return 0
+}
+
+# 定位会话中运行 kimi 的面板;没有则返回活跃面板
+find_kimi_pane() {
+    local pane
+    pane=$(tmux list-panes -t "$1" -F '#{pane_id} #{pane_current_command}' 2>/dev/null \
+        | awk '$2=="kimi"{print $1; exit}')
+    if [ -z "$pane" ]; then
+        pane=$(tmux display-message -p -t "$1" '#{pane_id}')
     fi
-    exit 0
-fi
+    echo "$pane"
+}
 
-SESSION="${1:-kimi}"
+# 面板进程 1 秒内 CPU >= 5% 视为繁忙(返回 0)
+pane_busy() {
+    command -v top >/dev/null 2>&1 || return 1
+    local pid cpu
+    pid=$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null) || return 1
+    [ -n "$pid" ] || return 1
+    cpu=$(top -b -n 2 -d 1 -p "$pid" 2>/dev/null | awk -v p="$pid" '$1==p{c=$9} END{print c+0}')
+    awk "BEGIN{exit !(${cpu:-0} >= 5)}"
+}
 
-if [ -n "$TMUX" ]; then
-    echo "kc: 已在 tmux 会话中,请先退出(detach)后再运行 kc" >&2
-    exit 1
-fi
+confirm() {
+    local reply
+    read -r -p "kc: $1? [y/N] " reply || die "已取消"
+    case "$reply" in
+        y|Y|yes|YES) ;;
+        *) die "已取消" ;;
+    esac
+}
 
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    exec tmux attach-session -t "$SESSION"
-fi
+# 所有"受管"会话: 面板里有 kimi 进程,或带 @kc_managed 标记
+kc_sessions() {
+    {
+        tmux list-panes -a -F '#{session_name} #{pane_current_command}' 2>/dev/null \
+            | awk '$2=="kimi"{print $1}'
+        tmux list-sessions -F '#{session_name}' 2>/dev/null \
+            | while read -r s; do
+                [ "$(tmux show-option -qv -t "$s" @kc_managed)" = "1" ] && echo "$s"
+            done
+    } | sort -u
+}
 
-exec tmux new-session -s "$SESSION" 'kimi' \; set-option mouse on
+restart_session() {
+    local s="$1" force="${2:-0}" pane quoted cmd
+    pane=$(find_kimi_pane "$s")
+    [ -n "$pane" ] || die "会话 '$s' 中没有可用面板"
+    if [ "$force" != 1 ] && pane_busy "$pane"; then
+        confirm "会话 '$s' 的实例疑似正在执行任务,仍要重启"
+    fi
+    quoted=$(tmux show-option -qv -t "$s" @kc_args)
+    cmd="kimi --continue"
+    [ -z "$quoted" ] || cmd="$cmd $quoted"
+    tmux respawn-pane -k -t "$pane" "$cmd"
+    echo "kc: 会话 '$s' 已重启 ($cmd)"
+}
+
+cmd_open() {
+    need kimi
+    local dir="" session="" passthrough=() a
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -C) [ $# -ge 2 ] || die "-C 需要目录参数"; dir="$2"; shift 2 ;;
+            --) shift; passthrough=("$@"); break ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "未知参数: $1(详见 kc -h)" ;;
+            *) [ -z "$session" ] || die "会话名只能给一个"; session="$1"; shift ;;
+        esac
+    done
+    session="${session:-$DEFAULT_SESSION}"
+    valid_session "$session" || die "非法会话名: '$session'(不能包含 . : 或空格)"
+    if [ -n "$dir" ]; then
+        [ -d "$dir" ] || die "目录不存在: $dir"
+        dir=$(cd "$dir" && pwd)
+    fi
+
+    if tmux has-session -t "$session" 2>/dev/null; then
+        [ ${#passthrough[@]} -eq 0 ] || echo "kc: 会话已存在,忽略 -- 之后的参数" >&2
+        if [ -n "${TMUX:-}" ]; then
+            exec tmux switch-client -t "$session"
+        fi
+        exec tmux attach-session -t "$session"
+    fi
+
+    local quoted="" cmd="kimi"
+    for a in ${passthrough[@]+"${passthrough[@]}"}; do
+        quoted+="$(printf '%q' "$a") "
+    done
+    [ -z "$quoted" ] || cmd="kimi ${quoted% }"
+
+    local tmargs=(-s "$session")
+    [ -z "$dir" ] || tmargs+=(-c "$dir")
+    tmargs+=("$cmd" \; set-option mouse on \; set-option @kc_managed 1 \; set-option @kc_args "$quoted")
+    if [ -n "${TMUX:-}" ]; then
+        tmux new-session -d "${tmargs[@]}"
+        exec tmux switch-client -t "$session"
+    fi
+    exec tmux new-session "${tmargs[@]}"
+}
+
+cmd_ls() {
+    local bin_ver
+    bin_ver=$(kimi --version 2>/dev/null | head -1) || true
+    echo "kimi 二进制版本: ${bin_ver:-未安装}"
+    if ! tmux list-sessions >/dev/null 2>&1; then
+        echo "(当前没有 tmux 会话)"
+        exit 0
+    fi
+    printf '%-16s %-4s %-8s %-12s %s\n' "会话" "附加" "PID" "运行时长" "说明"
+    local s attached pid etime note managed
+    while read -r s; do
+        attached=$(tmux display-message -p -t "$s" '#{session_attached}')
+        [ "$attached" = "1" ] && attached="是" || attached="否"
+        pid=$(tmux list-panes -t "$s" -F '#{pane_current_command} #{pane_pid}' \
+            | awk '$1=="kimi"{print $2; exit}')
+        if [ -n "$pid" ]; then
+            etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+            note="kimi 运行中"
+        else
+            pid="-"; etime="-"
+            managed=$(tmux show-option -qv -t "$s" @kc_managed)
+            if [ "$managed" = "1" ]; then
+                note="kimi 已退出(可用 kc restart 拉起)"
+            else
+                note="-"
+            fi
+        fi
+        printf '%-16s %-4s %-8s %-12s %s\n' "$s" "$attached" "$pid" "${etime:--}" "$note"
+    done < <(tmux list-sessions -F '#{session_name}')
+}
+
+cmd_peek() {
+    local session="${1:-$DEFAULT_SESSION}" lines="${2:-40}" pane
+    [[ "$lines" =~ ^[0-9]+$ ]] || die "行数必须是数字: $lines"
+    tmux has-session -t "$session" 2>/dev/null || die "会话不存在: $session"
+    pane=$(find_kimi_pane "$session")
+    tmux capture-pane -p -t "$pane" -S "-$lines" | sed -e :a -e '/^\n*$/{$d;N;ba}'
+}
+
+cmd_restart() {
+    need kimi
+    local force=0 session=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes) force=1 ;;
+            -*) die "未知参数: $1" ;;
+            *) [ -z "$session" ] || die "会话名只能给一个"; session="$1" ;;
+        esac
+        shift
+    done
+    session="${session:-$DEFAULT_SESSION}"
+    tmux has-session -t "$session" 2>/dev/null || die "会话不存在: $session"
+    restart_session "$session" "$force"
+}
+
+cmd_upgrade() {
+    need kimi
+    local all=0 force=0 session=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all) all=1 ;;
+            -y|--yes) force=1 ;;
+            -*) die "未知参数: $1" ;;
+            *) [ -z "$session" ] || die "会话名只能给一个"; session="$1" ;;
+        esac
+        shift
+    done
+    [ "$all" = 0 ] || [ -z "$session" ] || die "--all 与会话名不能同时使用"
+
+    local before after
+    before=$(kimi --version 2>/dev/null | head -1)
+    echo "==> 检查并升级 kimi code..."
+    kimi upgrade -y
+    after=$(kimi --version 2>/dev/null | head -1)
+    if [ "$before" = "$after" ]; then
+        echo "kimi 已是最新版本 ($after),无需重启实例(如需重启请用 kc restart)"
+        exit 0
+    fi
+    echo "==> 已升级: $before -> $after"
+
+    local targets=() t
+    if [ "$all" = 1 ]; then
+        mapfile -t targets < <(kc_sessions)
+    else
+        session="${session:-$DEFAULT_SESSION}"
+        if tmux has-session -t "$session" 2>/dev/null; then
+            targets=("$session")
+        else
+            echo "kc: 会话 '$session' 不存在,跳过重启"
+        fi
+    fi
+    [ ${#targets[@]} -gt 0 ] || { echo "没有需要重启的实例"; exit 0; }
+    for t in "${targets[@]}"; do
+        restart_session "$t" "$force"
+    done
+    echo "完成: 所有实例已更新"
+}
+
+cmd_stop() {
+    local session="${1:-$DEFAULT_SESSION}"
+    tmux has-session -t "$session" 2>/dev/null || die "会话不存在: $session"
+    tmux kill-session -t "$session"
+    echo "kc: 会话 '$session' 已结束"
+}
+
+main() {
+    need tmux
+    local cmd="${1:-}"
+    case "$cmd" in
+        upgrade) shift; cmd_upgrade "$@" ;;
+        restart) shift; cmd_restart "$@" ;;
+        stop|kill) shift; cmd_stop "$@" ;;
+        peek) shift; cmd_peek "$@" ;;
+        ls|list) cmd_ls ;;
+        -h|--help|help) usage ;;
+        -V|--version) echo "kc $KC_VERSION" ;;
+        *) cmd_open "$@" ;;
+    esac
+}
+
+main "$@"
