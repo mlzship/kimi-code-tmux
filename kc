@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# kc - 在 tmux 会话中启动 kimi code,并开启鼠标模式
+# 用法: kc [会话名]          默认会话名 kimi;会话已存在则直接接入
+#       kc upgrade [会话名]  升级 kimi 到最新版,并原地重启 tmux 会话中的实例
+#                            (旧进程会被终止,以 kimi --continue 重启,会话历史自动恢复)
+
+set -e
+
+if [ "$1" = "upgrade" ]; then
+    SESSION="${2:-kimi}"
+
+    echo "==> 升级 kimi code..."
+    kimi upgrade -y
+
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "==> 重启 tmux 会话 '$SESSION' 中的实例(旧进程将被终止)..."
+        tmux respawn-pane -k -t "$SESSION" 'kimi --continue'
+        echo "完成: '$SESSION' 中的实例已更新并恢复原会话,执行 kc 即可接入。"
+    else
+        echo "完成: kimi 已升级;tmux 会话 '$SESSION' 不存在,无需重启。"
+    fi
+    exit 0
+fi
+
+SESSION="${1:-kimi}"
+
+if [ -n "$TMUX" ]; then
+    echo "kc: 已在 tmux 会话中,请先退出(detach)后再运行 kc" >&2
+    exit 1
+fi
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach-session -t "$SESSION"
+fi
+
+exec tmux new-session -s "$SESSION" 'kimi' \; set-option mouse on
