@@ -31,15 +31,30 @@ kc -V|--version                        显示 kc 版本
 
 ## 安装
 
+一行命令(自动检查并安装缺失依赖,包括 Kimi Code CLI 本体):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mlzship/kimi-code-tmux/main/install.sh | bash
+```
+
+没有 curl 时可用 wget:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/mlzship/kimi-code-tmux/main/install.sh | bash
+```
+
+安装脚本会:
+
+1. 检查 `bash` / `tmux` / `procps`(`ps`,`top`) / `curl`或`wget`,缺失时自动用系统包管理器安装
+   (支持 apt / dnf / yum / pacman / apk / zypper,即 Debian、Ubuntu、RHEL、Fedora、Arch、Alpine、openSUSE 等常见发行版)
+2. 未检测到 `kimi` 时,调用 [Kimi Code 官方安装脚本](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html)安装
+3. 把 `kc` 安装到 `/usr/local/bin`(无 root/sudo 权限时退到 `~/.local/bin`),并尽量安装 bash 补全
+
+也可手动安装:
+
 ```bash
 sudo curl -fsSL https://raw.githubusercontent.com/mlzship/kimi-code-tmux/main/kc -o /usr/local/bin/kc
 sudo chmod +x /usr/local/bin/kc
-```
-
-可选:bash 补全
-
-```bash
-sudo curl -fsSL https://raw.githubusercontent.com/mlzship/kimi-code-tmux/main/completion/kc.bash -o /etc/bash_completion.d/kc
 ```
 
 ## 依赖
