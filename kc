@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-KC_VERSION="1.1.0"
+KC_VERSION="1.1.2"
 DEFAULT_SESSION="kimi"
 
 die() { echo "kc: $*" >&2; exit 1; }
@@ -28,7 +28,7 @@ kc - 在 tmux 中启动/管理 Kimi Code CLI
   - 会话名不能包含 . : 或空格
   - 启动时 -- 之后的参数会传给 kimi,并记录在会话中,供 restart/upgrade 复用
   - restart/upgrade 会检测实例是否繁忙,繁忙时需确认(-y 跳过确认)
-  - upgrade 时若 kimi 已是最新则跳过重启;--all 表示更新所有受管会话
+  - upgrade 时若二进制已是最新,会继续检查运行中的实例是否过旧,仅重启过旧实例
 EOF
 }
 
@@ -67,6 +67,27 @@ confirm() {
         y|Y|yes|YES) ;;
         *) die "已取消" ;;
     esac
+}
+
+# 返回面板中 kimi 进程的 PID(找不到返回空)
+kimi_pid_of_pane() {
+    local pid
+    pid=$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null) || return 1
+    if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "kimi" ]; then
+        echo "$pid"
+        return 0
+    fi
+    pgrep -xo kimi 2>/dev/null | head -1
+}
+
+# 运行中的实例是否仍是旧二进制: 二进制被替换后,旧进程的 exe 指向已删除文件
+instance_stale() {
+    local exe
+    exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+    case "$exe" in
+        *"(deleted)") return 0 ;;
+    esac
+    return 1
 }
 
 # 所有"受管"会话: 面板里有 kimi 进程,或带 @kc_managed 标记
@@ -155,7 +176,11 @@ cmd_ls() {
             | awk '$1=="kimi"{print $2; exit}')
         if [ -n "$pid" ]; then
             etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
-            note="kimi 运行中"
+            if instance_stale "$pid"; then
+                note="kimi 运行中(版本过旧,建议 kc upgrade 或 kc restart)"
+            else
+                note="kimi 运行中"
+            fi
         else
             pid="-"; etime="-"
             managed=$(tmux show-option -qv -t "$s" @kc_managed)
@@ -207,33 +232,55 @@ cmd_upgrade() {
     done
     [ "$all" = 0 ] || [ -z "$session" ] || die "--all 与会话名不能同时使用"
 
+    # 先确定要处理的会话
+    local targets=()
+    if [ "$all" = 1 ]; then
+        mapfile -t targets < <(kc_sessions)
+    elif tmux has-session -t "${session:-$DEFAULT_SESSION}" 2>/dev/null; then
+        targets=("${session:-$DEFAULT_SESSION}")
+    fi
+
     local before after
     before=$(kimi --version 2>/dev/null | head -1)
     echo "==> 检查并升级 kimi code..."
     kimi upgrade -y
     after=$(kimi --version 2>/dev/null | head -1)
-    if [ "$before" = "$after" ]; then
-        echo "kimi 已是最新版本 ($after),无需重启实例(如需重启请用 kc restart)"
+
+    local t pane pid
+    if [ "$before" != "$after" ]; then
+        echo "==> 已升级: $before -> $after"
+        [ ${#targets[@]} -gt 0 ] || { echo "没有需要重启的实例"; exit 0; }
+        for t in "${targets[@]}"; do
+            restart_session "$t" "$force"
+        done
+        echo "完成: 所有实例已更新"
         exit 0
     fi
-    echo "==> 已升级: $before -> $after"
 
-    local targets=() t
-    if [ "$all" = 1 ]; then
-        mapfile -t targets < <(kc_sessions)
-    else
-        session="${session:-$DEFAULT_SESSION}"
-        if tmux has-session -t "$session" 2>/dev/null; then
-            targets=("$session")
-        else
-            echo "kc: 会话 '$session' 不存在,跳过重启"
-        fi
-    fi
-    [ ${#targets[@]} -gt 0 ] || { echo "没有需要重启的实例"; exit 0; }
+    # 二进制没变,但运行中的实例可能仍是旧版本(旧进程的 exe 已删除)
+    echo "kimi 二进制已是最新 ($after),检查运行中的实例是否仍是旧版本..."
+    [ ${#targets[@]} -gt 0 ] || { echo "没有运行中的受管实例"; exit 0; }
+    local stale=0
     for t in "${targets[@]}"; do
-        restart_session "$t" "$force"
+        pane=$(find_kimi_pane "$t")
+        pid=$(kimi_pid_of_pane "$pane")
+        if [ -z "$pid" ]; then
+            echo "kc: 会话 '$t' 中 kimi 未在运行(可用 kc restart 拉起)"
+            continue
+        fi
+        if instance_stale "$pid"; then
+            stale=1
+            echo "kc: 会话 '$t' 的实例(PID $pid)仍在运行旧版本,重启以加载新版..."
+            restart_session "$t" "$force"
+        else
+            echo "kc: 会话 '$t' 的实例(PID $pid)已是最新版本,无需重启"
+        fi
     done
-    echo "完成: 所有实例已更新"
+    if [ "$stale" = 1 ]; then
+        echo "完成: 过旧实例已更新"
+    else
+        echo "完成: 所有实例均为最新"
+    fi
 }
 
 cmd_stop() {
